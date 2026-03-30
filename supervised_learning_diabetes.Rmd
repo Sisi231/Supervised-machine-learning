@@ -1,0 +1,1178 @@
+---
+title: "Statistical Learning"
+subtitle: "Supervised Learning"
+output:
+  html_document: 
+    theme: cerulean
+    highlight: tango
+    number_sections: no
+    toc: no
+    toc_depth: 1
+  pdf_document:
+    theme: cerulean
+    highlight: tango
+    number_sections: yes
+    toc: yes
+    toc_depth: 1
+date: "2024-11-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+```
+
+# Libraries 
+```{r}
+rm(list = ls())
+library(dplyr)
+library(GGally)
+library(ggplot2)
+library(MASS)
+library(tidyverse)
+library(skimr)
+library(mice)
+library(VIM)
+library(MASS)
+library(glmnet)
+library(e1071) 
+library(rpart)
+library(pROC)
+library(class)
+library(randomForest)
+library(caret)
+library(gbm)
+library(rpart.plot)
+library(randomForest)
+library(pdp)
+library(fastshap)
+library(reshape2)
+```
+
+# Dataset and variable selection
+
+We have decided to use the R-library NHANES(National Health and Nutrition Examination Survey) dataset for our project. It is a dataset that shows the health data of survey takers in the year intervals 2009-2010 and 2011-2012. This dataset has 10000 observations and 76 variables. We plan to use it to predict whether a person has diabetes or no. Hence, our target
+variable is Diabetes.
+```{r}
+install.packages("NHANES")
+library(NHANES)
+```
+
+If the previous code doesn't work due to different version of RStudio, the 
+following code should work. Please set your working directory to be the folder 
+with all the documents of our homework. 
+```{r}
+NHANES <- read.csv("NHANES_data.csv")
+```
+
+```{r}
+data("NHANES")
+head(NHANES)
+```
+
+Looking at the first three observations' ID, we see that there are some repetitions. 
+Our first step will be to remove those repetitions. Then looking at the summary of 
+the data, we can see that there are columns that have a lot of NA values. For our 
+purposes of using this data for supervised learning, we can remove those variables.
+Also, we have chosen to keep most of the categorical features.
+```{r}
+# choose only the unique observations 
+unique_data <- NHANES %>% distinct(ID, .keep_all = TRUE)
+summary(unique_data)
+# Choose which variables will be most useful
+my_data = unique_data %>% dplyr::select("Gender", "Race1", "Age",
+                                        "MaritalStatus","HHIncome", "Weight", 
+                                        "Height", "BMI", "BMICatUnder20yrs", 
+                                        "DirectChol", "TotChol","Pulse", "BPSysAve",
+                                        "BPDiaAve", "UrineVol1", "UrineFlow1", 
+                                        "PhysActive", "SleepHrsNight",
+                                        "Diabetes")
+```
+
+# Dealing with NA values
+
+Remove all observations that have NA value for Diabetes:
+```{r}
+my_data <- my_data %>% 
+  filter(!is.na(Diabetes))
+summary(my_data)
+```
+
+We can see that the ratio between those with and those without Diabetes is 1:11.
+```{r}
+# Find which rows have the most NA values
+na_count <- rowSums(is.na(my_data))
+unique_na_counts <- unique(na_count)
+sort(unique_na_counts) # there are rows with missing from 0 - 14
+# As some rows have a lot of missing data, it would be best if we remove them. 
+# Hence any rows that have more than 6 missing values will be removed
+my_data <- my_data[!(na_count %in% c(6, 7, 8, 9, 10, 11, 12, 13, 14)), ]
+# We are left with 5559 observations, which is good.
+summary(my_data) 
+```
+
+Now the ratio between those with and those without Diabetes is 1:9,4
+
+For marital status, we can check the ages of the people with NA values. Like 
+this we find out that all of them except a few are below 20 years old, so we change their marital status to NeverMarried.  
+```{r}
+ages_of_no_marital_status <- my_data$Age[is.na(my_data$MaritalStatus)]
+# The sorting shows us how many of the people with NA marital status are older 
+# than 20 years old
+sort(ages_of_no_marital_status, decreasing = TRUE)
+my_data$MaritalStatus[is.na(my_data$MaritalStatus)] = "NeverMarried"
+summary(my_data)
+```
+
+To fix the NA values in HHIncome we will find the mode and use it to fill these 
+null cells.
+```{r}
+levels(my_data$HHIncome)
+my_data <- my_data %>%
+  mutate(HHIncome = case_when(
+    HHIncome %in% c("0-4999", "5000-9999", "10000-14999", "15000-19999") ~ "Low Income",
+    HHIncome %in% c("20000-24999", "25000-34999","35000-44999", "45000-54999") ~ "Middle Income",
+    HHIncome %in% c("55000-64999", "65000-74999", "75000-99999", "more 99999") ~ "High Income"
+  ))
+
+my_data$HHIncome <- factor(my_data$HHIncome)
+mode_income <- names(sort(table(my_data$HHIncome), decreasing = TRUE))[1]
+my_data$HHIncome[is.na(my_data$HHIncome)] <- mode_income
+```
+
+To fix the missing values for weight and height we will look for the age of each 
+person and find the average weight/height for this age range and put that as our 
+new value. The missing BMI values will be calculated based on the added weight 
+and height.
+```{r}
+my_data <- my_data %>%
+  mutate(AgeGroup = cut(Age, breaks = seq(0, max(Age, na.rm = TRUE), by = 2), include.lowest = TRUE)) %>%
+  group_by(AgeGroup) %>%
+  mutate(
+    Weight = ifelse(is.na(Weight), mean(Weight, na.rm = TRUE), Weight),
+    Height = ifelse(is.na(Height), mean(Height, na.rm = TRUE), Height)
+  ) %>%
+  ungroup()
+my_data = my_data %>% dplyr::select(-AgeGroup)
+my_data$BMI[is.na(my_data$BMI)] <- my_data$Weight[is.na(my_data$BMI)] / (my_data$Height[is.na(my_data$BMI)]^2)
+summary(my_data)
+```
+
+Because for people under 20 the BMI works differently than for adults, we will 
+use the BMICatUnder20yrs column to decide if their weight is healthy or not and 
+add to that column in the NA cells whether the health of the older people is good
+or bad based on the general ranges. Lastly, we will rename that column to BMI
+(removing the original BMI column)
+```{r}
+my_data <- my_data %>%
+  mutate(
+    BMICatUnder20yrs = case_when(
+      is.na(BMICatUnder20yrs) & BMI >= 30 ~ "Obese",
+      is.na(BMICatUnder20yrs) & 25 <= BMI & BMI < 30 ~ "OverWeight",
+      is.na(BMICatUnder20yrs) & 18.5 <= BMI & BMI < 25  ~ "NormWeight",
+      is.na(BMICatUnder20yrs) & BMI < 18.5 ~ "UnderWeight",
+      TRUE ~ BMICatUnder20yrs  
+    )
+  )
+my_data$BMICatUnder20yrs <- as.character(my_data$BMICatUnder20yrs)
+my_data$BMICatUnder20yrs <- as.factor(my_data$BMICatUnder20yrs)
+my_data = my_data %>% dplyr::select(-BMI)
+my_data <- my_data %>%
+  rename(BMI = BMICatUnder20yrs)
+summary(my_data)
+```
+
+As we can see the NA values in the PhysActive column are mostly children. As 
+children and teens are rather active and have a lot of energy, we decided to label 
+them as physically active. 
+```{r}
+ages_of_na_phys_active <- my_data$Age[is.na(my_data$PhysActive)]
+sort(unique(ages_of_na_phys_active))
+my_data$PhysActive[is.na(my_data$PhysActive)] = "Yes"
+```
+
+To fix the missing values for the rest of the numerical variables we will look for 
+the age of each person and find the average of every variable for this age range 
+and put that as our new value.
+```{r}
+
+my_data$Pulse = as.numeric(my_data$Pulse)
+my_data$BPSysAve = as.numeric(my_data$BPSysAve)
+my_data$BPDiaAve = as.numeric(my_data$BPDiaAve)
+my_data$UrineVol1 = as.numeric(my_data$UrineVol1)
+my_data$SleepHrsNight = as.numeric(my_data$SleepHrsNight)
+
+my_data <- my_data %>%
+  mutate(AgeGroup = cut(Age, breaks = seq(0, max(Age, na.rm = TRUE), by = 2), include.lowest = TRUE)) %>%
+  group_by(AgeGroup) %>%
+  mutate(
+    DirectChol = ifelse(is.na(DirectChol), mean(DirectChol, na.rm = TRUE), DirectChol),
+    TotChol = ifelse(is.na(TotChol), mean(TotChol, na.rm = TRUE), TotChol),
+    Pulse = ifelse(is.na(Pulse), mean(Pulse, na.rm = TRUE), Pulse),
+    BPSysAve = ifelse(is.na(BPSysAve), mean(BPSysAve, na.rm = TRUE), BPSysAve),
+    BPDiaAve = ifelse(is.na(BPDiaAve), mean(BPDiaAve, na.rm = TRUE), BPDiaAve),
+    UrineVol1 = ifelse(is.na(UrineVol1), mean(UrineVol1, na.rm = TRUE), UrineVol1),
+    UrineFlow1 = ifelse(is.na(UrineFlow1), mean(UrineFlow1, na.rm = TRUE), UrineFlow1),
+    SleepHrsNight = ifelse(is.na(SleepHrsNight), mean(SleepHrsNight, na.rm = TRUE), SleepHrsNight)
+  ) %>%
+  ungroup()
+
+my_data = my_data %>% dplyr::select(-AgeGroup)
+summary(my_data)
+```
+
+As we can see only the column with sleep hours still has na values, which means 
+that for some ages there is absolutely no sleep data. Let's check which ages 
+these are:
+```{r}
+ages_of_na_sleep <- my_data$Age[is.na(my_data$SleepHrsNight)]
+sort(unique(ages_of_na_sleep))
+# These are older children and pre-teens. Children between ages of 6 and 12 
+# should sleep between 9 and 12 hours, while teens between 13 and 18 should sleep 
+# between 8 and 10 hours. We can hence assume that ages 8-12 sleep 10 hours and
+# ages 13-14 sleep 9 hours.
+my_data <- my_data %>%
+  mutate(
+    SleepHrsNight = case_when(
+      is.na(SleepHrsNight) & 8 <= Age & Age <= 12 ~ 10,
+      is.na(SleepHrsNight) & 13 <= Age & Age <= 14  ~ 9,
+      TRUE ~ SleepHrsNight  
+    )
+  )
+summary(my_data)
+# SleepAdjusted shows if based on age, a person is sleeping enough. We will remove
+# SleepHrsNight and replace it with this variable as it would give a more accurate 
+# interpretation if the person sleeps enough for their age.
+my_data$SleepAdjusted <- ifelse(my_data$Age <= 5, my_data$SleepHrsNight / 12, ifelse(my_data$Age <= 12, my_data$SleepHrsNight / 10, ifelse(my_data$Age <= 18, my_data$SleepHrsNight / 9, my_data$SleepHrsNight / 7)))
+my_data = my_data %>% dplyr::select(-SleepHrsNight)
+```
+
+# Dealing with outliers:
+```{r}
+numerical_data = my_data %>% dplyr::select(where(is.numeric))
+boxplot(numerical_data[, sapply(numerical_data, is.numeric)],las = 2, cex.axis = 0.5)
+```
+
+```{r}
+# 1) Identify them
+identify_outliers <- function(x) {
+  Q1 <- quantile(x, 0.25, na.rm = TRUE)
+  Q3 <- quantile(x, 0.75, na.rm = TRUE)
+  IQR_value <- Q3 - Q1
+  outliers <- x < (Q1 - 1.5 * IQR_value) | x > (Q3 + 1.5 * IQR_value)
+  return(outliers)
+}
+
+# Apply outlier function to each numeric column
+outlier_matrix <- sapply(numerical_data[, sapply(numerical_data, is.numeric)], identify_outliers)
+
+# Check which columns and rows have outliers
+outliers_by_variable <- colSums(outlier_matrix) # Number of outliers per variable
+outliers_by_variable
+```
+
+We can see that UrineFlow1 has many outliers so we decided to see its correlation 
+to UrineVol1 to decide if we should keep it or not. 
+```{r}
+ggcorr(numerical_data)
+```
+
+As this is true, we will remove UrineFlow1.Now, we will also remove all outliers.
+```{r}
+numerical_data = numerical_data %>% dplyr::select(-UrineFlow1)
+outlier_matrix <- sapply(numerical_data[, sapply(numerical_data, is.numeric)], identify_outliers)
+my_data = my_data %>% dplyr::select(-UrineFlow1)
+cleaned_data <- my_data[!rowSums(outlier_matrix), ]
+summary(cleaned_data)
+```
+
+As we can see the ratio between people with Diabetes vs those without is still 
+roughly 1:10, which is better than what we started with in the begining. 
+
+# Visualization
+
+1. Create histograms to show the distribution of each variable.
+
+This allows us to see which variables are normally distributed, which are skewed, 
+which are multimodal(have peaks in the histogram), or which have low variance.
+```{r}
+numeric_vars <- c("Age", "Weight", "Height", "DirectChol", "Pulse", "BPSysAve", 
+                  "BPDiaAve", "TotChol", "UrineVol1", "SleepAdjusted")
+for (var in numeric_vars) {
+  p <- ggplot(cleaned_data, aes_string(var)) +
+    geom_histogram(bins = 30, fill = "pink", color = "red") +
+    theme_minimal() +
+    ggtitle(paste("Distribution of", var)) +
+    xlab(var) + ylab("Frequency") +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  print(p)
+}
+# If it gives a warning, just run that section again.
+```
+
+UrineVol1 is very skewed, which could affect some of the supervised learning models,
+which we will use. 
+
+# Deal with skewness. 
+```{r}
+offset <- abs(min(cleaned_data$UrineVol1)) + 1  
+boxcox_result <- boxcox((cleaned_data$UrineVol1 + offset) ~ 1)
+lambda <- boxcox_result$x[which.max(boxcox_result$y)]
+cleaned_data$UrineVol1 <- ((cleaned_data$UrineVol1 + offset)^lambda - 1) / lambda
+
+ggplot(cleaned_data, aes_string("UrineVol1")) +
+    geom_histogram(bins = 30, fill = "pink", color = "red") +
+    theme_minimal() +
+    ggtitle(paste("Distribution of", "UrineVol1")) +
+    xlab("UrineVol1") + ylab("Frequency") +
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+### Correlations between predictors
+
+```{r}
+ggcorr(cleaned_data[,-1],label=T,hjust=0.8,size = 2)
+```
+
+Moderate correlation
+
+Distribution of Diabetes
+```{r}
+ggplot(cleaned_data, aes(x = Diabetes)) +
+  geom_bar(fill = "pink") +
+  theme_minimal() +
+  labs(title = "Distribution of Diabetes", x = "Diabetes", y = "Count")
+```
+
+This means that our dataset is unbalanced so we will need to be more careful with 
+interpreting the results of our models and make sure that our model is not choosing
+wrongly just to get a better overall accuracy score.
+
+```{r}
+
+numeric_vars <- c("Gender", "Race1", "BMI", "MaritalStatus", "HHIncome", "PhysActive")
+for (var in numeric_vars) {
+  p <- ggplot(cleaned_data, aes_string(x = var, fill = "Diabetes")) +
+    geom_bar(position = "fill") +
+    theme_minimal() +
+    ggtitle(paste("Proportion of Diabetes by", var)) +
+    xlab(var) + ylab("Proportion") +
+    theme(plot.title = element_text(hjust = 0.5))+
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  print(p)
+}
+
+
+```
+
+As we can see by the graphs gender doesn't really affect the probability of a person
+having diabetes. From race standpoint, black people are the most likely to have diabetes, 
+but the proportions for the other races is not that different. The graph shows that 
+obese and over weight people are more likely to be diabetic than normal or under 
+weight people. For marital status, 25% of widowed people and roughly 20% of divorced
+and separated people have diabetes. In the never married category(which includes 
+mainly young people), there are less than 5% people with diabetes.  Income doesn't
+really show that any group has a particularly larger probability to have diabetes, 
+but the people with low income are more likely to have it. Lastly, people that
+are not physically active are also more likely to be diabetic then those that
+are physically active.
+
+```{r}
+numeric_vars <- c("Age", "Weight", "Height", "DirectChol", "Pulse", "BPSysAve", 
+                  "BPDiaAve", "TotChol", "UrineVol1", "SleepAdjusted")
+for (var in numeric_vars) {
+  p <- ggplot(cleaned_data, aes_string(x = var, fill = "Diabetes")) +
+    geom_density(alpha = 0.6) +
+    theme_minimal() +
+    ggtitle(paste(var, " Distribution by Diabetes Status")) +
+    xlab(var) + ylab("Density") +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  print(p)
+}
+
+
+```
+
+From these graphs we can see that older people, people that weight more or people
+that have higher BPSysAve are more likely to be diabetic. Otherwise, the other 
+variables don't really show a particular impact on the diagnosis.  
+
+
+# Normalization of variables:
+```{r}
+normalize_z <- function(x) {(x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)}
+normalized_cleaned_data <- cleaned_data %>%
+  mutate(across(where(is.numeric), normalize_z))
+```
+
+# Classification
+
+
+# Splitting the data into training(40%) and testing(60%) data
+```{r}
+set.seed(10)
+split <- createDataPartition(normalized_cleaned_data$Diabetes, p = 0.4, list = FALSE) 
+training_data <- normalized_cleaned_data[ split,]
+testing_data <- normalized_cleaned_data[-split,]
+nrow(training_data)
+nrow(testing_data)
+
+table(training_data$Diabetes)/length(training_data$Diabetes)
+```
+
+As we can see the dataset is very unbalanced with roughly 9.4% of the samples
+being diabetic and 90.6% not being diabetic.
+
+# Bayes Classifiers
+
+## Linear discriminant analysis
+```{r}
+lda.model <- lda(Diabetes ~ ., data=training_data)
+lda.model
+```
+
+This shows that the most important variables(variables with large coefficients) 
+for our prediction are Age, Race1White, MaritalStatusLivePartner.
+Age's coefficient is positive, which means that it is associated with a higher chance
+of being in the diabetes positive group. Older people are more likely to be diabetic.
+People that are white or have a marital status of LivePartner are less likely to 
+be diabetic. 
+
+Overall the most important predictors are Age, Race, Marital Status, while 
+moderate predictors are Weight, Height, HHIncome, BPSysAve, BPDiaAve. The other
+don't contribute as much. 
+```{r}
+probability_lda = predict(lda.model, newdata=testing_data)$posterior
+head(probability_lda)
+```
+```{r}
+prediction_lda = predict(lda.model, newdata=testing_data)$class
+head(prediction_lda)
+```
+```{r}
+print(confusionMatrix(prediction_lda, testing_data$Diabetes)$table)
+print(confusionMatrix(prediction_lda, testing_data$Diabetes)$overall[1])
+print(confusionMatrix(prediction_lda, testing_data$Diabetes)$byClass["Specificity"])
+print(confusionMatrix(prediction_lda, testing_data$Diabetes)$byClass["Balanced Accuracy"])
+```
+
+The accuracy looks good, however the specificity and balanced accuracy prove otherwise.
+Interpretation of specificity: The model correctly identifies 24.7% of individuals with diabetes ("Yes" cases). The model misses a substantial number of true positive cases.
+Interpretation of balanced accuracy: The model is not the best and there is room
+for improvement in balancing the classification for the classes.
+
+
+## Quadratic discriminant analysis
+
+```{r}
+qda.model <- qda(Diabetes ~ ., data=training_data)
+qda.model
+```
+
+The most important variables are Age(big difference between "Yes" and "No" groups), BMIObese
+(significant difference in the BMI categories between the two groups(Yes and No) suggests that obesity is important factor), Race variables(Differences in race categories can be helpful to  decide between the two classes), and Income(different distributions for the two groups, which indicates that financial factors could be important).
+
+Performance:
+
+```{r}
+prediction_qda = predict(qda.model, newdata=testing_data)$class
+print(confusionMatrix(prediction_qda, testing_data$Diabetes)$table)
+print(confusionMatrix(prediction_qda, testing_data$Diabetes)$overall[1])
+print(confusionMatrix(prediction_qda, testing_data$Diabetes)$byClass["Specificity"])
+print(confusionMatrix(prediction_qda, testing_data$Diabetes)$byClass["Balanced Accuracy"])
+```
+
+The accuracy is not bad.
+
+Interpretation of specificity: The model correctly identifies 50.9% of individuals with diabetes ("Yes" cases). The model misses a substantial number of true positive cases.
+Interpretation of balanced accuracy: The model is not the best and there is room
+for improvement in balancing the classification for the classes.
+
+Between the LDA and QDA model, the QDA is better as while its overall accuracy is
+less, its balanced accuracy is higher and its specificity is higher, which indicate 
+that this model is less biased than the previous one.  
+
+
+# Modeling
+
+### Logistic regression
+
+Because we have binary classification, we can use the standard glm function in R:
+
+```{r}
+logit.model <- glm(formula = Diabetes ~ . , family=binomial(link='logit'), data=training_data)
+
+logit.model <- glm(Diabetes ~ ., family=binomial(link='logit'), data=training_data)
+summary(logit.model)
+```
+
+The significant variables(p-value < 0.05) are Age + Weight + Height + TotChol +
+MaritalStatus + Pulse + BPSysAve + SleepAdjusted.
+age, marital status, weight, height, cholesterol, blood pressure, and pulse rate
+Age(p-value < 0.001): age increases -> chance of having diabetes increases
+MaritalStatusLivePartner(p-value = 0.0237): living with a partner decreases the 
+chance of having diabetes. The same for MartialStatus NeverMarried and Widowed.
+Weight (p-value < 0.001): Higher weight - hidher possibility of diabetes.
+Height (p-value = 0.00144): Height increases - likelihood of diabetes decreases
+TotChol (p-value = 0.00196): Negative association with diabetes.
+Pulse (p-value = 0.0097): Higher pulse, higher chance
+BPSysAve (p-value = 0.0182): Positive association with diabetes.
+SleepAdjusted (p-value = 0.0422): negative association with diabetes.
+
+```{r}
+logit.model.signif <- glm(formula = Diabetes ~ Age + Weight + Height + TotChol +
+                            MaritalStatus + Pulse + BPSysAve + SleepAdjusted,
+                          family=binomial(link='logit'), data=training_data)
+
+summary(logit.model.signif)
+```
+
+We can also remove now fully MaritalStatus.
+```{r}
+logit.model.signif <- glm(formula = Diabetes ~ Age + Weight + Height + TotChol +
+                            Pulse + BPSysAve + SleepAdjusted,
+                          family=binomial(link='logit'), data=training_data)
+
+summary(logit.model.signif)
+```
+
+Make predictions (posterior probabilities)
+
+```{r}
+probability <- predict(logit.model.signif,newdata=testing_data, type='response')
+head(probability)
+prediction <- as.factor(ifelse(probability > 0.5,"Yes","No"))
+head(prediction)
+```
+
+Performance: confusion matrix
+```{r}
+confusionMatrix(prediction, testing_data$Diabetes)
+```
+
+This is not a good model as we can see that the specificity is very low, which 
+means that the model predict correctly only 11.03% of the people that have diabetes.
+
+Obtain posterior probabilities and compute the ROC
+
+```{r}
+probability = predict(logit.model.signif ,newdata = testing_data, type='response')
+roc.glm <- roc(testing_data$Diabetes, probability)
+plot.roc(testing_data$Diabetes, probability,col="darkblue", print.auc = TRUE,  auc.polygon=TRUE, grid=c(0.1, 0.2),
+         grid.col=c("darkblue", "red"), max.auc.polygon=TRUE,
+         auc.polygon.col="lightblue", print.thres=TRUE, legacy.axes = TRUE)
+
+```
+
+```{r}
+prediction <- as.factor(ifelse(probability > 0.074,"Yes","No"))
+confusionMatrix(prediction, testing_data$Diabetes)
+```
+
+As we can see this time specificity is far better. The balanced accuracy has also
+improved. Hence, while this model has overall a lower accuracy, it is better than 
+the previous one in correctly guessing when a person has diabetes.
+
+
+### Penalized logistic regression
+
+```{r}
+logit.model <- glmnet(as.matrix(training_data[,-1]),training_data$Diabetes,
+                      family=c("binomial"), alpha=0, lambda=0.01)
+summary(logit.model$beta)
+probability <- predict(logit.model,as.matrix(testing_data[,-1]), type='response')
+prediction <- as.factor(ifelse(probability > 0.092,"Yes","No"))
+confusionMatrix(prediction, testing_data$Diabetes)
+```
+
+```{r, warning=FALSE, message=FALSE}
+alpha_values <- seq(0, 1, by = 0.1)  
+lambda_values <- 10^seq(-4, 0, by = 0.1)  
+
+results <- data.frame(alpha = numeric(), lambda = numeric(), 
+                      balanced_accuracy = numeric(), specificity = numeric(),
+                      threshold = numeric())
+training_matrix <- model.matrix(Diabetes ~ ., data = training_data)[, -1]
+testing_matrix <- model.matrix(Diabetes ~ ., data = testing_data)[, -1]
+
+for (alpha in alpha_values) {
+  for (lambda in lambda_values) {
+    logit.model <- glmnet(training_matrix, training_data$Diabetes, 
+                          family = "binomial", alpha = alpha, lambda = lambda)
+    
+    probability <- predict(logit.model, newx = testing_matrix, type = "response")
+    
+    roc.glm <- roc(testing_data$Diabetes, probability)
+    optimal_threshold <- coords(roc.glm, "best", ret = "threshold")
+    
+    # Convert the probabilities into predicted class labels (using a cutoff of 0.5)
+    predicted_class <- ifelse(probability > optimal_threshold[1,1], "Yes", "No")
+    
+    # Calculate the confusion matrix and other evaluation metrics
+    confusion <- confusionMatrix(factor(predicted_class, levels = c("No", "Yes")), factor(testing_data$Diabetes, levels = c("No", "Yes")))
+    
+    # Get accuracy and AUC
+    balanced_accuracy <- confusion$byClass["Balanced Accuracy"]
+    specificity = confusion$byClass["Specificity"]
+    roc_curve <- roc(testing_data$Diabetes, probability)
+    auc_value <- auc(roc_curve)
+    
+    # Store results
+    results <- rbind(results, data.frame(alpha = alpha, lambda = lambda, balanced_accuracy = balanced_accuracy, specificity = specificity, threshold = optimal_threshold[1,1]))
+  }
+}
+
+# Find the best alpha and lambda based on balanced accuracy
+best_model <- results[which.max(results$balanced_accuracy),]
+cat("Best model based on balanced accuracy:\n")
+print(best_model)
+```
+
+From this we can see that we obtain the best model when the alpha is 0.8, the
+lambda is 0.00794, and the threshold is 0.076. The balanced accuracy 0.7898 and the specificity is 0.882.
+
+```{r}
+lambda = results$lambda[which.max(results$balanced_accuracy)]
+alpha = results$alpha[which.max(results$balanced_accuracy)]
+threshold = results$threshold[which.max(results$balanced_accuracy)]
+
+logit.model <- glmnet(training_matrix,training_data$Diabetes,
+                      family=c("binomial"), alpha=alpha, lambda=lambda)
+summary(logit.model$beta)
+probability <- predict(logit.model,testing_matrix, type='response')
+prediction <- as.factor(ifelse(probability > threshold,"Yes","No"))
+confusionMatrix(prediction, testing_data$Diabetes)
+```
+
+# Health impact
+True Positive (Positive/Has Diabetes): Early diagnosis can be very benefitial to 
+a person's health. The health impact of a true positive will be +10.
+
+False Positive (Positive/No Diabetes): Unnecessary treatments and stressful 
+situation. The health impact of a false positive will be -1.
+
+False Negative (Negative/Has Diabetes): Misdiagnosis could mean severe complications
+and increased chance of death. The health impact will be -15.
+
+True Negative (Negative/No Diabetes): No harm or benefit. The health impact will be 0.
+
+```{r}
+health.impact.unit <- c(0, -1, -15, 10)
+conf_matrix = confusionMatrix(prediction, testing_data$Diabetes)$table
+health.impact.per.patient <- sum(health.impact.unit * conf_matrix) / sum(conf_matrix)
+health.impact.per.patient
+```
+
+This is not bad as it shows that on average our model is able to correctly identify when a person has diabetes, which outweighs the harm that FP and FN cause.
+
+# Machine learning tools (classification)
+
+## Decision Tree
+```{r decision_tree}
+set.seed(123)
+# tuning the hyper parameters to find the best decision tree model
+minsplit_values = c(50, 100, 120)
+maxdepth_values = c(6, 7, 8,9,10,11,12)
+cp_values = 10^(-seq(from=3, to=5, by=1))
+results <- data.frame(
+  minsplit = numeric(0),
+  maxdepth = numeric(0),
+  cp = numeric(0),
+  specificity = numeric(0),
+  balanced_accuracy = numeric(0)
+)
+for (minsplit in minsplit_values) {
+  for (maxdepth in maxdepth_values) {
+    for (cp in cp_values) {
+      tree <- train(Diabetes ~ ., 
+                    data = training_data, 
+                    method = "rpart",
+                    parms = list(prior = c(0.5, 0.5)),
+                    control = rpart.control(minsplit = minsplit, 
+                                            maxdepth = maxdepth, 
+                                            cp = cp),
+                    trControl = trainControl(method = "cv", number = 5))
+      
+      treepred <- predict(tree, testing_data, type = "raw")
+      conf_matrix <- confusionMatrix(treepred, testing_data$Diabetes)
+      specificity <- conf_matrix$byClass["Specificity"]
+      balanced_accuracy <- conf_matrix$byClass["Balanced Accuracy"]
+      results <- rbind(results, data.frame(
+        minsplit = minsplit,
+        maxdepth = maxdepth,
+        cp = cp,
+        specificity = specificity,
+        balanced_accuracy = balanced_accuracy
+      ))
+    }
+  }
+}
+
+best_val = which.max(results$specificity)
+tree <- train(Diabetes ~ ., 
+              data = training_data, 
+              method = "rpart",
+              parms = list(prior = c(0.5, 0.5)),
+              control = rpart.control(minsplit = results$minsplit[best_val],
+                                      maxdepth = results$maxdepth[best_val],
+                                      cp = results$cp[best_val]),
+              trControl = trainControl(method = "cv", number = 5))
+      
+treepred <- predict(tree, testing_data, type = "raw")
+conf_matrix <- confusionMatrix(treepred, testing_data$Diabetes)
+specificity <- conf_matrix$byClass["Specificity"]
+sensitivity <- conf_matrix$byClass["Sensitivity"]
+balanced_accuracy <- conf_matrix$byClass["Balanced Accuracy"]
+accuracy <- conf_matrix$overall[1]
+print(conf_matrix$table)
+print(specificity)
+print(sensitivity)
+print(balanced_accuracy)
+print(accuracy)
+      
+print(rpart.plot(tree$finalModel))
+
+varImp(tree)
+
+```
+
+We can see that this is a rather good model because the specificity is 0.79, which means that the model can predict correctly 79.84% of the people that have diabetes.
+
+The most important variable is Age here with BPSysAve, BMIObese, Weight, and 
+MaritalStatusNeverMarried also showing a significance. 
+
+# Health impact with decision tree.
+```{r}
+health.impact.unit1 <- c(0, -1, -15, 10)
+health.impact.per.patient <- sum(health.impact.unit1 * conf_matrix$table) / sum(conf_matrix$table)
+health.impact.per.patient
+```
+
+Net positive, which is very good.
+
+# Random Forest
+
+```{r}
+set.seed(123)
+
+#tuning the hyper parameters:
+paramsForest <- expand.grid(ntree = seq(800, 1100, 100), mtry = seq(2, 16, 1))
+
+
+result_df <- data.frame(
+  mtry = numeric(0), 
+  ntree = numeric(0), 
+  accuracy = numeric(0), 
+  specificity = numeric(0), 
+  balanced_accuracy = numeric(0)
+)
+
+for (p in 1:nrow(paramsForest)) {
+  forest <- randomForest(
+    formula = Diabetes ~ ., 
+    data = training_data,
+    mtry = paramsForest$mtry[p], 
+    ntree = paramsForest$ntree[p],
+    importance = TRUE
+  )
+  
+  pred <- predict(forest, newdata = testing_data[,-16])  
+  
+  conf_matrix_rf = confusionMatrix(pred, testing_data$Diabetes)
+  accuracy = conf_matrix_rf$overall[1]
+  specificity <- conf_matrix_rf$byClass["Specificity"]
+  sensitivity <- conf_matrix_rf$byClass["Sensitivity"]
+  balanced_accuracy <- conf_matrix_rf$byClass["Balanced Accuracy"]
+
+  result_df <- rbind(result_df, data.frame(
+    mtry = paramsForest$mtry[p],
+    ntree = paramsForest$ntree[p],
+    accuracy = accuracy,
+    specificity = specificity,
+    balanced_accuracy = balanced_accuracy
+  ))
+}
+
+# get the model with the best specificity
+best = which.max(result_df$specificity)
+result_df[best,]
+# train a model with the hyper parameters of the best model from above
+best_df = randomForest(formula = Diabetes ~ ., data = training_data, mtry = result_df$mtry[best], ntree = result_df$ntree[best],importance = TRUE)
+pred <- predict(best_df, newdata = testing_data[,-16])  
+conf_matrix_rf = confusionMatrix(pred, testing_data$Diabetes)
+accuracy = conf_matrix_rf$overall[1]
+specificity <- conf_matrix_rf$byClass["Specificity"]
+sensitivity <- conf_matrix_rf$byClass["Sensitivity"]
+balanced_accuracy <- conf_matrix_rf$byClass["Balanced Accuracy"]
+
+# see variable importance
+r <- varImp(best_df, scale = T)
+r$No <- NULL
+names(r)<- c("Metrics")
+r$Name <- rownames(r)
+data.frame(r)
+r$Name <- factor(r$Name , levels = r$Name [order(r$Metrics)])
+ggplot(r) +
+ aes(x = Name, weight = Metrics) +
+ geom_bar(fill = "pink", color = 'red') +
+ labs(x = " ", y = " ", title = "Variable Importance", 
+ caption = " ") +
+ coord_flip() +
+ theme_minimal() +
+ theme(plot.title = element_text(size = 17L, face = "bold", 
+ hjust = 0.5))
+
+```
+
+This model is significantly worse, with a specificity of around 0.145-0.163, which means that it is unable to correctly predict "Yes" cases and is leaning towards
+predicting everything to be "No".
+
+As for variable importance, the most important variable is Age, followed by 
+TotChol, Race, Height, and Weight.
+
+
+# Gradient Boosting
+```{r gradient_boosting}
+# Fit a gradient boosting model
+set.seed(123)
+GBM.train <- gbm(ifelse(training_data$Diabetes=="Yes",0,1) ~., data=training_data, distribution= "bernoulli",n.trees=500,shrinkage = 0.01,interaction.depth=2,n.minobsinnode = 8)
+gbmProb = predict(GBM.train, newdata=testing_data, n.trees=500,type="response")
+gbmProb<-ifelse(gbmProb> 0.9,"No","Yes")
+confusionMatrix(factor(gbmProb), testing_data$Diabetes)$table
+
+testing_data$Diabetes = as.factor(testing_data$Diabetes)
+conf_matrix = confusionMatrix(factor(gbmProb), testing_data$Diabetes)
+
+specificity = conf_matrix$byClass["Specificity"]
+sensitivity = conf_matrix$byClass["Sensitivity"]
+balanced_accuracy = conf_matrix$byClass["Balanced Accuracy"]
+print(specificity)
+print(sensitivity)
+print(balanced_accuracy)
+```
+
+Specificity is 0.74, which is very good.
+
+# Risk Learning
+
+```{r risk_learning}
+# Calculate risk for each patient based on diabetes probability
+# Assuming that a higher probability of diabetes corresponds to higher risk
+risk_scores <- predict(GBM.train, newdata = testing_data, n.trees = 500, type = "response") * 100
+
+# Visualize risk distribution
+hist(risk_scores, col = "lightblue", main = "Risk Scores", xlab = "Risk Score")
+summary(risk_scores)
+
+
+# Define a high-risk threshold, which we can see in the summary that should be below 90 (mean of risk_scores)
+high_risk <- risk_scores < 90
+
+
+# Percentage of high-risk patients
+high_risk_percentage <- sum(high_risk) / length(risk_scores) * 100
+cat("Percentage of high-risk patients:", high_risk_percentage, "%\n")
+
+# Identify the most at-risk patients
+sorted_risk <- sort(risk_scores, decreasing = FALSE, index.return = TRUE)
+
+# Top risk scores
+cat("Top Risk Scores:\n")
+print(head(sorted_risk$x))
+
+# Indices of the most at-risk patients
+cat("Indices of Top Risk Patients:\n")
+print(head(sorted_risk$ix))
+
+# Analyze characteristics of the top at-risk patients
+top_risk_patients <- testing_data[sorted_risk$ix[1:5], ]
+cat("Top At-Risk Patients:\n")
+print(top_risk_patients)
+
+```
+
+# Model Interpretation and analysis
+
+## Partial Dependence Plots
+
+We are going to see how the five most important features are related with the target variable 'Diabetes'.
+
+### Partial Dependent Plot for 'Age'
+```{r}
+# Generate Partial Dependence Plot for 'Age'
+pdp_plot1 <- partial(best_df, pred.var = "Age", grid.resolution = 20, prob = TRUE, which.class = 2)
+
+# Plot the Partial Dependence Plot
+autoplot(pdp_plot1, rug = TRUE, train = training_data) +
+  ggtitle('Partial Dependence Plot for Age') +
+  xlab('Age') +
+  ylab('Predicted Probability of Positive Diabetes') +
+  theme_minimal()
+```
+
+The plot shows how the predicted probability of having Diabetes changes with age.
+
+Older people have a higher probability of having Diabetes.
+
+
+### Partial Dependent Plot for 'TotChol' (Total Cholesterol)
+```{r}
+# Generate Partial Dependence Plot for 'Totchol'
+pdp_plot2 <- partial(best_df, pred.var = "TotChol", grid.resolution = 20, prob = TRUE, which.class = 2)
+
+# Plot the Partial Dependence Plot
+autoplot(pdp_plot2, rug = TRUE, train = training_data) +
+  ggtitle('Partial Dependence Plot for Total Cholesterol') +
+  xlab('TotChol') +
+  ylab('Predicted Probability of Positive Diabetes') +
+  theme_minimal()
+
+```
+
+People with lower total cholestrol tend to have a bigger chance of being diabetic.
+
+### Partial Dependent Plot for 'Weight' 
+```{r}
+# Generate Partial Dependence Plot for 'Weight'
+pdp_plot3 <- partial(best_df, pred.var = "Weight", grid.resolution = 20, prob = TRUE, which.class = 2)
+
+# Plot the Partial Dependence Plot
+autoplot(pdp_plot3, rug = TRUE, train = training_data) +
+  ggtitle('Partial Dependence Plot for Weight') +
+  xlab('Weight') +
+  ylab('Predicted Probability of Positive Diabetes') +
+  theme_minimal()
+
+```
+
+The plot shows how the predicted probability of having Diabetes changes with weight.
+
+A higher weight may be associated with a higher probability of having Diabetes.
+
+
+### Partial Dependent Plot for 'Height' 
+```{r}
+# Generate Partial Dependence Plot for 'Height'
+pdp_plot4 <- partial(best_df, pred.var = "Height", grid.resolution = 20, prob = TRUE, which.class = 2)
+
+# Plot the Partial Dependence Plot
+autoplot(pdp_plot4, rug = TRUE, train = training_data) +
+  ggtitle('Partial Dependence Plot for Height') +
+  xlab('Height') +
+  ylab('Predicted Probability of Positive Diabetes') +
+  theme_minimal()
+
+```
+
+The plot shows how the predicted probability of having Diabetes changes with Height.
+
+We can observe that shorter people have a higher probability of having Diabetes.
+
+
+### Partial Dependent Plot for 'Race1' 
+```{r}
+# Generate Partial Dependence Plot for 'Race1'
+pdp_plot5 <- partial(best_df, pred.var = "Race1", grid.resolution = 20, prob = TRUE, which.class = 2)
+
+# Plot the Partial Dependence Plot
+autoplot(pdp_plot5, rug = TRUE, train = training_data) +
+  ggtitle('Partial Dependence Plot for Race1') +
+  xlab('Race1') +
+  ylab('Predicted Probability of Positive Diabetes') +
+  theme_minimal()
+
+```
+
+The plot shows how the predicted probability of having Diabetes changes with Marital Status.
+
+White people are the least probable to have Diabetes, and all the other races have similar probabilities of having Diabetes, which are significantly higher than of white people.
+
+
+
+# SHAP Values for Model Interpretability
+
+We'll use SHAP (SHapley Additive exPlanations) values to interpret our Random Forest model. SHAP values provide a unified measure of feature importance and allow us to understand individual predictions.
+
+```{r}
+
+# Define the prediction function
+predict_function <- function(object, newdata) {
+  predict(object, newdata = newdata, type = "prob")[, "Yes"]
+}
+
+X <- training_data[, -16] # All except for the row of Diabetes
+y <- training_data$Diabetes
+
+# Compute SHAP values
+set.seed(123)
+shap_values <- fastshap::explain(
+  object = best_df,
+  X = X,
+  pred_wrapper = predict_function,
+  nsim = 10,
+  adjust = TRUE
+)
+
+# View the SHAP values
+head(shap_values)
+```
+
+## SHAP summary plot
+
+```{r}
+# Prepare data for plotting
+long_shap <- melt(shap_values)
+
+# SHAP summary plot
+ggplot(long_shap, aes(x = value, y = Var2)) +
+  geom_violin(fill = "lightblue") +
+  ggtitle("SHAP Values for Random Forest Model") +
+  xlab("SHAP value (impact on model output)") +
+  ylab("Feature") +
+  theme_minimal()
+```
+
+Interpretation:
+
+The plot shows how each feature contributes to the model output.
+Wider distributions indicate more variability in feature impact.
+The center of the distribution around zero suggests a neutral effect.
+
+## SHAP Feature Importance Plot
+
+```{r}
+# Compute mean absolute SHAP values
+mean_abs_shap <- colMeans(abs(shap_values))
+
+# Create a data frame for plotting
+shap_importance <- data.frame(
+  Feature = names(mean_abs_shap),
+  MeanAbsShap = mean_abs_shap
+)
+
+# Plot SHAP feature importance
+ggplot(shap_importance, aes(x = reorder(Feature, MeanAbsShap), y = MeanAbsShap)) +
+  geom_bar(stat = 'identity', fill = 'pink', color = "red") +
+  coord_flip() +
+  ggtitle('Feature Importance based on Mean Absolute SHAP Values') +
+  xlab('') +
+  ylab('Mean |SHAP value|') +
+  theme_minimal()
+```
+
+Interpretation:
+
+Features with higher mean absolute SHAP values have a greater impact on the model's predictions.
+This plot provides an alternative to the traditional feature importance plot based on Gini importance.
+
+### SHAP Dependence Plots
+
+```{r}
+# SHAP dependence plot for 'Age'
+shap_values <- as.data.frame(shap_values)
+
+ggplot(data = data.frame(
+  SHAP_value = shap_values$Age,
+  Feature_value = X$Age
+), aes(x = Feature_value, y = SHAP_value)) +
+  geom_point(alpha = 0.6, color = "pink") +
+  geom_smooth(method = "loess", se = FALSE, color = "red") +
+  ggtitle('SHAP Dependence Plot for Age') +
+  xlab('Age') +
+  ylab('SHAP value') +
+  theme_minimal()
+```
+
+Interpretation:
+
+The plot shows the relationship between the value of Age and its impact on the prediction.
+Positive SHAP values indicate an increase in the probability of having Diabetes.
+A trend in the plot suggests how the feature influences the model's output, which in this case shows a higher probability of having Diabetes for older people.
+
+```{r}
+# SHAP dependence plot for 'BPSysAve'
+ggplot(data = data.frame(
+  SHAP_value = shap_values$BPSysAve,
+  Feature_value = X$BPSysAve
+), aes(x = Feature_value, y = SHAP_value)) +
+  geom_point(alpha = 0.6, color = "pink") +
+  geom_smooth(method = "loess", se = FALSE, color = "red") +
+  ggtitle('SHAP Dependence Plot for BPSysAve') +
+  xlab('BPSysAve') +
+  ylab('SHAP value') +
+  theme_minimal()
+```
+
+Interpretation:
+
+The plot shows the relationship between the value of BPSysAve and its impact on the prediction.
+Positive SHAP values indicate an increase in the probability of having Diabetes.
+A trend in the plot suggests how the feature influences the model's output, which in this case shows a higher probability of having Diabetes for people with higher BPSysAve levels.
+
+```{r}
+# SHAP dependence plot for 'TotChol'
+ggplot(data = data.frame(
+  SHAP_value = shap_values$TotChol,
+  Feature_value = X$TotChol
+), aes(x = Feature_value, y = SHAP_value)) +
+  geom_point(alpha = 0.6, color = "pink") +
+  geom_smooth(method = "loess", se = FALSE, color = "red") +
+  ggtitle('SHAP Dependence Plot for TotChol') +
+  xlab('TotChol') +
+  ylab('SHAP value') +
+  theme_minimal()
+```
+
+Interpretation:
+
+The plot shows the relationship between the value of TotChol and its impact on the prediction.
+Positive SHAP values indicate an increase in the probability of having Diabetes.
+A trend in the plot suggests how the feature influences the model's output, which in this case shows a higher probability of having Diabetes for people with low TotChol levels, and also some positive SHAP values for people with high TotChol levels.
+
+
+
+```{r}
+# SHAP dependence plot for 'Race1'
+ggplot(data = data.frame(
+  SHAP_value = shap_values$Race1,
+  Feature_value = X$Race1
+), aes(x = Feature_value, y = SHAP_value)) +
+  geom_point(alpha = 0.6, color = "pink") +
+  geom_smooth(method = "loess", se = FALSE, color = "red") +
+  ggtitle('SHAP Dependence Plot for Race1') +
+  xlab('Race1') +
+  ylab('SHAP value') +
+  theme_minimal()
+```
+
+Interpretation:
+
+The plot shows the relationship between the value of Race1 and its impact on the prediction.
+Positive SHAP values indicate an increase in the probability of having Diabetes.
+In this case we can see a lower probability of having Diabetes for white people, and a similar trend in probability for the other races.
+
+
+```{r}
+# SHAP dependence plot for 'Weight'
+ggplot(data = data.frame(
+  SHAP_value = shap_values$Weight,
+  Feature_value = X$Weight
+), aes(x = Feature_value, y = SHAP_value)) +
+  geom_point(alpha = 0.6, color = "pink") +
+  geom_smooth(method = "loess", se = FALSE, color = "red") +
+  ggtitle('SHAP Dependence Plot for Weight') +
+  xlab('Weight') +
+  ylab('SHAP value') +
+  theme_minimal()
+```
+
+Interpretation:
+
+The plot shows the relationship between the value of Weight and its impact on the prediction.
+Positive SHAP values indicate an increase in the probability of having Diabetes.
+A trend in the plot suggests how the feature influences the model's output, which in this case shows a higher probability of having Diabetes for people with higher Weight levels.
+
+
