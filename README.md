@@ -15,6 +15,18 @@ The goal is not only to build accurate models, but to prioritize **high specific
 
 The dataset includes demographic, health, and lifestyle variables such as age, weight, cholesterol levels, and blood pressure.
 
+# Tech Stack
+**Language:**  
+- R  
+
+**Libraries:**  
+- dplyr, tidyverse, ggplot2, GGally  
+- MASS, glmnet, e1071  
+- rpart, randomForest, gbm  
+- caret, pROC  
+- mice, VIM, skimr  
+- pdp, fastshap, reshape2  
+
 # Methods
 
 # Data Processing
@@ -87,27 +99,18 @@ A custom scoring system was designed:
 
 The final model yields a **positive overall health impact**, meaning correct diagnoses outweigh harmful misclassifications.
 
-# Tech Stack
-**Language:**  
-- R  
-
-**Libraries:**  
-- dplyr, tidyverse, ggplot2, GGally  
-- MASS, glmnet, e1071  
-- rpart, randomForest, gbm  
-- caret, pROC  
-- mice, VIM, skimr  
-- pdp, fastshap, reshape2  
-
 # How to Run
 
 1. Open the `.Rmd` file and run all chunks
 
 2. Load dataset:
+
 install.packages("NHANES")
+
 library(NHANES)
 
 If it fails, run:
+
 NHANES <- read.csv("NHANES_data.csv")
 
 3. Alternatively:
@@ -115,9 +118,23 @@ NHANES <- read.csv("NHANES_data.csv")
 Open the .html file to view results directly
 
 # Project Structure
-README.md
-report/
-│   └── Report.pdf
-notebook/
-│   ├── Statistical_Learning_Project.Rmd
-│   └── Statistical_Learning_Project.html
+├──README.md
+
+├──Data/
+
+      └── NHANES_data_csv
+
+├──Report/
+
+      └── Report.pdf
+
+├──Notebooks/
+
+      ├── Statistical_Learning_Project.Rmd
+
+      └── Statistical_Learning_Project.html
+
+# Author
+Silvia Andreeva
+
+Rocio Lopez Blazquez
